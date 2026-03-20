@@ -1,0 +1,56 @@
+name: Build Hikari-LLVM for Windows (Android Target)
+
+on:
+  workflow_dispatch: # Позволяет запускать сборку вручную по кнопке
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Configure CMake
+        shell: cmd
+        # Настраиваем сборку Clang и LLD. 
+        # AArch64 - это arm64-v8a, ARM - это armeabi-v7a
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S llvm -B build -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLVM_ENABLE_PROJECTS="clang;lld" ^
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=cl
+
+      - name: Build Clang and LLD
+        shell: cmd
+        # Собираем только нужные бинарники, чтобы сэкономить время
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          ninja -C build clang lld
+
+      - name: Package Artifacts
+        shell: cmd
+        # Собираем готовые .exe файлы в одну папку
+        run: |
+          mkdir hikari-toolchain\bin
+          copy build\bin\clang.exe hikari-toolchain\bin\
+          copy build\bin\clang++.exe hikari-toolchain\bin\
+          copy build\bin\lld.exe hikari-toolchain\bin\
+          copy build\bin\ld.lld.exe hikari-toolchain\bin\
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hikari-Windows-Toolchain
+          path: hikari-toolchain\
