@@ -152,8 +152,8 @@ static void emitDeadCode(BasicBlock *BB, IRBuilder<> &B) {
   Type *I64Ty = Type::getInt64Ty(BB->getContext());
   Value *junkA = B.CreateAlloca(I64Ty, nullptr, "opq.junk.a");
   Value *junkB = B.CreateAlloca(I64Ty, nullptr, "opq.junk.b");
-  ConstantInt *c1 = ConstantInt::get(I64Ty, cryptoutils->get_uint64_t());
-  ConstantInt *c2 = ConstantInt::get(I64Ty, cryptoutils->get_uint64_t());
+  Constant *c1 = ConstantInt::get(I64Ty, cryptoutils->get_uint64_t());
+  Constant *c2 = ConstantInt::get(I64Ty, cryptoutils->get_uint64_t());
   B.CreateStore(c1, junkA);
   B.CreateStore(c2, junkB);
   Value *v1 = B.CreateLoad(I64Ty, junkA, "opq.jl1");
