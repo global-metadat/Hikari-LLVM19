@@ -42,7 +42,7 @@ static Value *mbaOr(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
 
 // Noise injection: returns (result + noise - noise) with random constant
 static Value *injectNoise(Value *val, Instruction *insertPt) {
-  ConstantInt *noise = ConstantInt::get(val->getType(), cryptoutils->get_uint64_t());
+  Constant *noise = ConstantInt::get(val->getType(), cryptoutils->get_uint64_t());
   BinaryOperator *added = BinaryOperator::Create(Instruction::Add, val, noise, "", insertPt);
   return BinaryOperator::Create(Instruction::Sub, added, noise, "", insertPt);
 }
@@ -60,7 +60,7 @@ static Value *mbaAdd(Value *a, Value *b, Instruction *insertPt, uint32_t depth) 
     // (a ^ b) + 2*(a & b)
     Value *xorAB = mbaXor(a, b, insertPt, depth - 1);
     Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
+    Constant *two = ConstantInt::get(a->getType(), 2);
     Value *mul = BinaryOperator::Create(Instruction::Mul, andAB, two, "", insertPt);
     return BinaryOperator::Create(Instruction::Add, xorAB, mul, "", insertPt);
   }
@@ -74,7 +74,7 @@ static Value *mbaAdd(Value *a, Value *b, Instruction *insertPt, uint32_t depth) 
     // a - (~b) - 1
     Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
     Value *sub1 = mbaSub(a, notB, insertPt, depth - 1);
-    ConstantInt *one = ConstantInt::get(a->getType(), 1);
+    Constant *one = ConstantInt::get(a->getType(), 1);
     return BinaryOperator::Create(Instruction::Sub, sub1, one, "", insertPt);
   }
   }
@@ -94,7 +94,7 @@ static Value *mbaSub(Value *a, Value *b, Instruction *insertPt, uint32_t depth) 
     // a + (~b) + 1
     Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
     Value *add1 = mbaAdd(a, notB, insertPt, depth - 1);
-    ConstantInt *one = ConstantInt::get(a->getType(), 1);
+    Constant *one = ConstantInt::get(a->getType(), 1);
     return BinaryOperator::Create(Instruction::Add, add1, one, "", insertPt);
   }
   case 1: {
@@ -102,7 +102,7 @@ static Value *mbaSub(Value *a, Value *b, Instruction *insertPt, uint32_t depth) 
     Value *xorAB = mbaXor(a, b, insertPt, depth - 1);
     Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
     Value *andNAB = mbaAnd(notA, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
+    Constant *two = ConstantInt::get(a->getType(), 2);
     Value *mul = BinaryOperator::Create(Instruction::Mul, andNAB, two, "", insertPt);
     return BinaryOperator::Create(Instruction::Sub, xorAB, mul, "", insertPt);
   }
@@ -145,7 +145,7 @@ static Value *mbaXor(Value *a, Value *b, Instruction *insertPt, uint32_t depth) 
     // (a + b) - 2*(a & b)
     Value *addAB = mbaAdd(a, b, insertPt, depth - 1);
     Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
+    Constant *two = ConstantInt::get(a->getType(), 2);
     Value *mul = BinaryOperator::Create(Instruction::Mul, andAB, two, "", insertPt);
     return BinaryOperator::Create(Instruction::Sub, addAB, mul, "", insertPt);
   }
