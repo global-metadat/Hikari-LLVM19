@@ -241,7 +241,7 @@ struct VMFlatten : public FunctionPass {
       BasicBlock *BB = origBBs[i];
       BB->moveBefore(loopEnd);
 
-      ConstantInt *caseVal = ConstantInt::get(I32Ty, caseIDs[i]);
+      auto *caseVal = cast<ConstantInt>(ConstantInt::get(I32Ty, caseIDs[i]));
       switchI->addCase(caseVal, BB);
     }
 
@@ -347,7 +347,7 @@ struct VMFlatten : public FunctionPass {
           }
         }
       }
-      switchI->addCase(ConstantInt::get(I32Ty, fakeID), fakeBB);
+      switchI->addCase(cast<ConstantInt>(ConstantInt::get(I32Ty, fakeID)), fakeBB);
     }
 
     // ── Step 10: Fix SSA (demote to stack for cross-block references) ──
