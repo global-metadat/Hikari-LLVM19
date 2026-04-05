@@ -17,6 +17,8 @@ add_llvm_component_library(LLVMObfuscation
         MBAObfuscation.cpp
         OpaquePredicates.cpp
         VMFlatten.cpp
+        AntiLinearSweep.cpp
+        AntiHexRays.cpp
         Obfuscation.cpp
         DEPENDS
         intrinsics_gen
