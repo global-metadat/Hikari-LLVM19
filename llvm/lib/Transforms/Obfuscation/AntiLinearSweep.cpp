@@ -130,17 +130,6 @@ struct AntiLinearSweep : public FunctionPass {
     bool runOnFunction(Function &F) override {
         if (!flag) return false;
 
-        bool hasAnnotation = false;
-        if (auto *MD = F.getMetadata("MD_obf")) {
-            for (unsigned i = 0; i < MD->getNumOperands(); i++) {
-                if (auto *S = dyn_cast<MDString>(MD->getOperand(i))) {
-                    if (S->getString() == "als" || S->getString() == "antidisasm")
-                        hasAnnotation = true;
-                }
-            }
-        }
-        if (!flag && !hasAnnotation) return false;
-
         std::string triple = F.getParent()->getTargetTriple();
         if (triple.find("aarch64") == std::string::npos &&
             triple.find("arm64") == std::string::npos)
