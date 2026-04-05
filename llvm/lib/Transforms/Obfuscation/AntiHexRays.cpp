@@ -38,8 +38,6 @@ static cl::opt<unsigned> AHRDensity(
     "ahr_density", cl::init(2), cl::NotHidden,
     cl::desc("Number of anti-decompiler insertions per block (1-4)"));
 
-extern llvm::CryptoUtils *cryptoutils;
-
 namespace {
 
 static GlobalVariable *getOrCreateOpaqueGlobal(Module &M, const std::string &name) {
@@ -83,8 +81,11 @@ static Value *buildOpaqueZero(IRBuilder<> &B, GlobalVariable *opqVar, unsigned d
             Value *b = B.CreateLoad(I64Ty, opqVar);
             cast<LoadInst>(b)->setVolatile(true);
             // Use a - a instead (Hex-Rays might simplify x^x but not vol1-vol2)
-            result = B.CreateAdd(result, B.CreateSub(a, B.CreateLoad(I64Ty, opqVar)));
-            cast<LoadInst>(result->getOperand(1))->setVolatile(false); // trick
+            Value *sub = B.CreateSub(a, B.CreateLoad(I64Ty, opqVar));
+            result = B.CreateAdd(result, sub);
+            if (auto *SubI = dyn_cast<Instruction>(sub))
+                if (auto *LI = dyn_cast<LoadInst>(SubI->getOperand(1)))
+                    LI->setVolatile(false); // trick
             break;
         }
         case 2: {
