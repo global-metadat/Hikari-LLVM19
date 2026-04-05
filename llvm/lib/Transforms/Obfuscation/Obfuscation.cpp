@@ -1,323 +1,343 @@
-// MBA (Mixed Boolean-Arithmetic) Obfuscation Pass
-// Replaces arithmetic/logic IR instructions with equivalent MBA expressions.
-// Unlike Hikari's Substitution pass (1 layer), this applies N layers recursively,
-// producing ~50-200 instructions per original operation at depth 3.
-//
-// Usage: -mllvm --enable-mbaobf -mllvm --mba_prob=60 -mllvm --mba_depth=2
-
+// For open-source license, please refer to
+// [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
+//===----------------------------------------------------------------------===//
+/*
+  Hikari 's own "Pass Scheduler".
+  Because currently there is no way to add dependency to transform passes
+  Ref : http://lists.llvm.org/pipermail/llvm-dev/2011-February/038109.html
+*/
+#include "llvm/Transforms/Obfuscation/Obfuscation.h"
 #include "llvm/Transforms/Obfuscation/MBAObfuscation.h"
-#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/Transforms/Obfuscation/OpaquePredicates.h"
+#include "llvm/Transforms/Obfuscation/VMFlatten.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstIterator.h"
-#include "llvm/IR/NoFolder.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/ADT/Statistic.h"
-#include <vector>
+#include <cstdlib>
 
 using namespace llvm;
 
-#define DEBUG_TYPE "mbaobf"
+// Begin Obfuscator Options
+static cl::opt<bool>
+    EnableIRObfusaction("hikari", cl::init(false), cl::NotHidden,
+                        cl::desc("Enable IR Code Obfuscation."),
+                        cl::ZeroOrMore);
+static cl::opt<uint64_t> AesSeed("aesSeed", cl::init(0x1337),
+                                 cl::desc("seed for the PRNG"));
+static cl::opt<bool> EnableAntiClassDump("enable-acdobf", cl::init(false),
+                                         cl::NotHidden,
+                                         cl::desc("Enable AntiClassDump."));
+static cl::opt<bool> EnableAntiHooking("enable-antihook", cl::init(false),
+                                       cl::NotHidden,
+                                       cl::desc("Enable AntiHooking."));
+static cl::opt<bool> EnableAntiDebugging("enable-adb", cl::init(false),
+                                         cl::NotHidden,
+                                         cl::desc("Enable AntiDebugging."));
+static cl::opt<bool>
+    EnableBogusControlFlow("enable-bcfobf", cl::init(false), cl::NotHidden,
+                           cl::desc("Enable BogusControlFlow."));
+static cl::opt<bool> EnableFlattening("enable-cffobf", cl::init(false),
+                                      cl::NotHidden,
+                                      cl::desc("Enable Flattening."));
+static cl::opt<bool>
+    EnableBasicBlockSplit("enable-splitobf", cl::init(false), cl::NotHidden,
+                          cl::desc("Enable BasicBlockSpliting."));
+static cl::opt<bool>
+    EnableSubstitution("enable-subobf", cl::init(false), cl::NotHidden,
+                       cl::desc("Enable Instruction Substitution."));
+static cl::opt<bool> EnableAllObfuscation("enable-allobf", cl::init(false),
+                                          cl::NotHidden,
+                                          cl::desc("Enable All Obfuscation."));
+static cl::opt<bool> EnableFunctionCallObfuscate(
+    "enable-fco", cl::init(false), cl::NotHidden,
+    cl::desc("Enable Function CallSite Obfuscation."));
+static cl::opt<bool>
+    EnableStringEncryption("enable-strcry", cl::init(false), cl::NotHidden,
+                           cl::desc("Enable String Encryption."));
+static cl::opt<bool>
+    EnableConstantEncryption("enable-constenc", cl::init(false), cl::NotHidden,
+                             cl::desc("Enable Constant Encryption."));
+static cl::opt<bool>
+    EnableIndirectBranching("enable-indibran", cl::init(false), cl::NotHidden,
+                            cl::desc("Enable Indirect Branching."));
+static cl::opt<bool>
+    EnableFunctionWrapper("enable-funcwra", cl::init(false), cl::NotHidden,
+                          cl::desc("Enable Function Wrapper."));
+static cl::opt<bool>
+    EnableMBAObfuscation("enable-mbaobf", cl::init(false), cl::NotHidden,
+                         cl::desc("Enable MBA Obfuscation."));
+static cl::opt<bool>
+    EnableOpaquePredicates("enable-opqpred", cl::init(false), cl::NotHidden,
+                           cl::desc("Enable Strong Opaque Predicates."));
+static cl::opt<bool>
+    EnableVMFlatten("enable-vmflatten", cl::init(false), cl::NotHidden,
+                    cl::desc("Enable VM-based Control Flow Virtualization."));
+// End Obfuscator Options
 
-static cl::opt<uint32_t>
-    MBAProbRate("mba_prob",
-                cl::desc("Probability [%] each instruction will be MBA-obfuscated"),
-                cl::value_desc("probability"), cl::init(40), cl::Optional);
-
-static cl::opt<uint32_t>
-    MBADepth("mba_depth",
-             cl::desc("Recursion depth for MBA substitution (1-4)"),
-             cl::value_desc("depth"), cl::init(2), cl::Optional);
-
-STATISTIC(MBATotal, "Total MBA substitutions applied");
-
-// ── MBA core: recursive substitution ──
-
-// Forward declarations
-static Value *mbaAdd(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
-static Value *mbaSub(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
-static Value *mbaXor(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
-static Value *mbaAnd(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
-static Value *mbaOr(Value *a, Value *b, Instruction *insertPt, uint32_t depth);
-
-// Noise injection: returns (result + noise - noise) with random constant
-static Value *injectNoise(Value *val, Instruction *insertPt) {
-  ConstantInt *noise = ConstantInt::get(val->getType(), cryptoutils->get_uint64_t());
-  BinaryOperator *added = BinaryOperator::Create(Instruction::Add, val, noise, "", insertPt);
-  return BinaryOperator::Create(Instruction::Sub, added, noise, "", insertPt);
+static void LoadEnv(void) {
+  if (getenv("SPLITOBF")) {
+    EnableBasicBlockSplit = true;
+  }
+  if (getenv("SUBOBF")) {
+    EnableSubstitution = true;
+  }
+  if (getenv("ALLOBF")) {
+    EnableAllObfuscation = true;
+  }
+  if (getenv("FCO")) {
+    EnableFunctionCallObfuscate = true;
+  }
+  if (getenv("STRCRY")) {
+    EnableStringEncryption = true;
+  }
+  if (getenv("INDIBRAN")) {
+    EnableIndirectBranching = true;
+  }
+  if (getenv("FUNCWRA")) {
+    EnableFunctionWrapper = true; // Broken
+  }
+  if (getenv("BCFOBF")) {
+    EnableBogusControlFlow = true;
+  }
+  if (getenv("ACDOBF")) {
+    EnableAntiClassDump = true;
+  }
+  if (getenv("CFFOBF")) {
+    EnableFlattening = true;
+  }
+  if (getenv("CONSTENC")) {
+    EnableConstantEncryption = true;
+  }
+  if (getenv("ANTIHOOK")) {
+    EnableAntiHooking = true;
+  }
+  if (getenv("ADB")) {
+    EnableAntiDebugging = true;
+  }
+  if (getenv("MBAOBF")) {
+    EnableMBAObfuscation = true;
+  }
+  if (getenv("OPQPRED")) {
+    EnableOpaquePredicates = true;
+  }
+  if (getenv("VMFLATTEN")) {
+    EnableVMFlatten = true;
+  }
 }
-
-// ── ADD substitutions ──
-// a + b = (a ^ b) + 2*(a & b)
-// a + b = (a | b) + (a & b)
-// a + b = a - (~b) - 1
-static Value *mbaAdd(Value *a, Value *b, Instruction *insertPt, uint32_t depth) {
-  if (depth == 0)
-    return BinaryOperator::Create(Instruction::Add, a, b, "", insertPt);
-
-  switch (cryptoutils->get_range(3)) {
-  case 0: {
-    // (a ^ b) + 2*(a & b)
-    Value *xorAB = mbaXor(a, b, insertPt, depth - 1);
-    Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
-    Value *mul = BinaryOperator::Create(Instruction::Mul, andAB, two, "", insertPt);
-    return BinaryOperator::Create(Instruction::Add, xorAB, mul, "", insertPt);
-  }
-  case 1: {
-    // (a | b) + (a & b)
-    Value *orAB = mbaOr(a, b, insertPt, depth - 1);
-    Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    return BinaryOperator::Create(Instruction::Add, orAB, andAB, "", insertPt);
-  }
-  case 2: {
-    // a - (~b) - 1
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *sub1 = mbaSub(a, notB, insertPt, depth - 1);
-    ConstantInt *one = ConstantInt::get(a->getType(), 1);
-    return BinaryOperator::Create(Instruction::Sub, sub1, one, "", insertPt);
-  }
-  }
-  llvm_unreachable("bad rng");
-}
-
-// ── SUB substitutions ──
-// a - b = a + (~b) + 1
-// a - b = (a ^ b) - 2*(~a & b)
-// a - b = (a & ~b) - (~a & b)
-static Value *mbaSub(Value *a, Value *b, Instruction *insertPt, uint32_t depth) {
-  if (depth == 0)
-    return BinaryOperator::Create(Instruction::Sub, a, b, "", insertPt);
-
-  switch (cryptoutils->get_range(3)) {
-  case 0: {
-    // a + (~b) + 1
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *add1 = mbaAdd(a, notB, insertPt, depth - 1);
-    ConstantInt *one = ConstantInt::get(a->getType(), 1);
-    return BinaryOperator::Create(Instruction::Add, add1, one, "", insertPt);
-  }
-  case 1: {
-    // (a ^ b) - 2*(~a & b)
-    Value *xorAB = mbaXor(a, b, insertPt, depth - 1);
-    Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
-    Value *andNAB = mbaAnd(notA, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
-    Value *mul = BinaryOperator::Create(Instruction::Mul, andNAB, two, "", insertPt);
-    return BinaryOperator::Create(Instruction::Sub, xorAB, mul, "", insertPt);
-  }
-  case 2: {
-    // (a & ~b) - (~a & b)
-    Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *andANB = mbaAnd(a, notB, insertPt, depth - 1);
-    Value *andNAB = mbaAnd(notA, b, insertPt, depth - 1);
-    return BinaryOperator::Create(Instruction::Sub, andANB, andNAB, "", insertPt);
-  }
-  }
-  llvm_unreachable("bad rng");
-}
-
-// ── XOR substitutions ──
-// a ^ b = (a | b) - (a & b)
-// a ^ b = (~a & b) | (a & ~b)
-// a ^ b = (a + b) - 2*(a & b)
-static Value *mbaXor(Value *a, Value *b, Instruction *insertPt, uint32_t depth) {
-  if (depth == 0)
-    return BinaryOperator::Create(Instruction::Xor, a, b, "", insertPt);
-
-  switch (cryptoutils->get_range(3)) {
-  case 0: {
-    // (a | b) - (a & b)
-    Value *orAB = mbaOr(a, b, insertPt, depth - 1);
-    Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    return BinaryOperator::Create(Instruction::Sub, orAB, andAB, "", insertPt);
-  }
-  case 1: {
-    // (~a & b) | (a & ~b)
-    Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *andNAB = mbaAnd(notA, b, insertPt, depth - 1);
-    Value *andANB = mbaAnd(a, notB, insertPt, depth - 1);
-    return mbaOr(andNAB, andANB, insertPt, depth - 1);
-  }
-  case 2: {
-    // (a + b) - 2*(a & b)
-    Value *addAB = mbaAdd(a, b, insertPt, depth - 1);
-    Value *andAB = mbaAnd(a, b, insertPt, depth - 1);
-    ConstantInt *two = ConstantInt::get(a->getType(), 2);
-    Value *mul = BinaryOperator::Create(Instruction::Mul, andAB, two, "", insertPt);
-    return BinaryOperator::Create(Instruction::Sub, addAB, mul, "", insertPt);
-  }
-  }
-  llvm_unreachable("bad rng");
-}
-
-// ── AND substitutions ──
-// a & b = (a | b) ^ (a ^ b)
-// a & b = (a + b - (a ^ b)) >> 1  -- only for depth 0/1 to avoid complexity
-// a & b = ~(~a | ~b)
-static Value *mbaAnd(Value *a, Value *b, Instruction *insertPt, uint32_t depth) {
-  if (depth == 0)
-    return BinaryOperator::Create(Instruction::And, a, b, "", insertPt);
-
-  switch (cryptoutils->get_range(3)) {
-  case 0: {
-    // (a | b) ^ (a ^ b)
-    Value *orAB = BinaryOperator::Create(Instruction::Or, a, b, "", insertPt);
-    Value *xorAB = BinaryOperator::Create(Instruction::Xor, a, b, "", insertPt);
-    return BinaryOperator::Create(Instruction::Xor, orAB, xorAB, "", insertPt);
-  }
-  case 1: {
-    // ~(~a | ~b)  (De Morgan)
-    Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *orNN = BinaryOperator::Create(Instruction::Or, notA, notB, "", insertPt);
-    return BinaryOperator::CreateNot(orNN, "", insertPt);
-  }
-  case 2: {
-    // a - (a & ~b)  →  a & b
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *andANB = BinaryOperator::Create(Instruction::And, a, notB, "", insertPt);
-    return BinaryOperator::Create(Instruction::Sub, a, andANB, "", insertPt);
-  }
-  }
-  llvm_unreachable("bad rng");
-}
-
-// ── OR substitutions ──
-// a | b = (a ^ b) | (a & b)
-// a | b = (a & b) + (a ^ b)
-// a | b = ~(~a & ~b)
-static Value *mbaOr(Value *a, Value *b, Instruction *insertPt, uint32_t depth) {
-  if (depth == 0)
-    return BinaryOperator::Create(Instruction::Or, a, b, "", insertPt);
-
-  switch (cryptoutils->get_range(3)) {
-  case 0: {
-    // (a ^ b) | (a & b)
-    Value *xorAB = BinaryOperator::Create(Instruction::Xor, a, b, "", insertPt);
-    Value *andAB = BinaryOperator::Create(Instruction::And, a, b, "", insertPt);
-    return BinaryOperator::Create(Instruction::Or, xorAB, andAB, "", insertPt);
-  }
-  case 1: {
-    // (a & b) + (a ^ b)
-    Value *andAB = BinaryOperator::Create(Instruction::And, a, b, "", insertPt);
-    Value *xorAB = BinaryOperator::Create(Instruction::Xor, a, b, "", insertPt);
-    return BinaryOperator::Create(Instruction::Add, andAB, xorAB, "", insertPt);
-  }
-  case 2: {
-    // ~(~a & ~b)  (De Morgan)
-    Value *notA = BinaryOperator::CreateNot(a, "", insertPt);
-    Value *notB = BinaryOperator::CreateNot(b, "", insertPt);
-    Value *andNN = BinaryOperator::Create(Instruction::And, notA, notB, "", insertPt);
-    return BinaryOperator::CreateNot(andNN, "", insertPt);
-  }
-  }
-  llvm_unreachable("bad rng");
-}
-
-// ── Pass implementation ──
-
-namespace {
-
-struct MBAObfuscation : public FunctionPass {
+namespace llvm {
+struct Obfuscation : public ModulePass {
   static char ID;
-  bool flag;
-
-  MBAObfuscation() : FunctionPass(ID) { this->flag = true; }
-  MBAObfuscation(bool flag) : MBAObfuscation() { this->flag = flag; }
-
-  bool runOnFunction(Function &F) override {
-    Function *tmp = &F;
-    if (!toObfuscate(flag, tmp, "mba"))
-      return false;
-
-    uint32_t depth = MBADepth;
-    if (depth > 4) depth = 4;
-    if (depth < 1) depth = 1;
-
-    errs() << "Running MBA Obfuscation (depth=" << depth << ") On "
-           << F.getName() << "\n";
-
-    // Collect instructions first to avoid iterator invalidation
-    std::vector<BinaryOperator *> candidates;
-    for (Instruction &I : instructions(F)) {
-      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        // Only obfuscate integer operations (not float)
-        if (!BO->getType()->isIntegerTy())
-          continue;
-        if (cryptoutils->get_range(100) >= MBAProbRate)
-          continue;
-
-        switch (BO->getOpcode()) {
-        case Instruction::Add:
-        case Instruction::Sub:
-        case Instruction::Xor:
-        case Instruction::And:
-        case Instruction::Or:
-          candidates.push_back(BO);
-          break;
-        default:
-          break;
-        }
-      }
-    }
-
-    if (candidates.empty())
-      return false;
-
-    for (BinaryOperator *BO : candidates) {
-      Value *a = BO->getOperand(0);
-      Value *b = BO->getOperand(1);
-      Value *result = nullptr;
-
-      switch (BO->getOpcode()) {
-      case Instruction::Add:
-        result = mbaAdd(a, b, BO, depth);
-        break;
-      case Instruction::Sub:
-        result = mbaSub(a, b, BO, depth);
-        break;
-      case Instruction::Xor:
-        result = mbaXor(a, b, BO, depth);
-        break;
-      case Instruction::And:
-        result = mbaAnd(a, b, BO, depth);
-        break;
-      case Instruction::Or:
-        result = mbaOr(a, b, BO, depth);
-        break;
-      default:
-        continue;
-      }
-
-      if (result) {
-        // Randomly inject noise (30% chance)
-        if (cryptoutils->get_range(100) < 30)
-          result = injectNoise(result, BO);
-
-        BO->replaceAllUsesWith(result);
-        ++MBATotal;
-      }
-    }
-
-    // Erase replaced instructions (reverse order to handle dependencies)
-    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
-      BinaryOperator *BO = *it;
-      if (BO->use_empty())
-        BO->eraseFromParent();
-    }
-
-    return true;
+  Obfuscation() : ModulePass(ID) {
+    initializeObfuscationPass(*PassRegistry::getPassRegistry());
   }
+  StringRef getPassName() const override {
+    return "HikariObfuscationScheduler";
+  }
+  bool runOnModule(Module &M) override {
+    if (!EnableIRObfusaction)
+      return 0;
+    TimerGroup *tg =
+        new TimerGroup("Obfuscation Timer Group", "Obfuscation Timer Group");
+    Timer *timer = new Timer("Obfuscation Timer", "Obfuscation Timer", *tg);
+    timer->startTimer();
+
+    errs() << "Running Hikari On " << M.getSourceFileName() << "\n";
+
+    annotation2Metadata(M);
+
+    ModulePass *MP = createAntiHookPass(EnableAntiHooking);
+    MP->doInitialization(M);
+    MP->runOnModule(M);
+    delete MP;
+    // Initial ACD Pass
+    if (EnableAllObfuscation || EnableAntiClassDump) {
+      ModulePass *P = createAntiClassDumpPass();
+      P->doInitialization(M);
+      P->runOnModule(M);
+      delete P;
+    }
+    // Now do FCO
+    FunctionPass *FP = createFunctionCallObfuscatePass(
+        EnableAllObfuscation || EnableFunctionCallObfuscate);
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        FP->runOnFunction(F);
+    delete FP;
+    MP = createAntiDebuggingPass(EnableAntiDebugging);
+    MP->runOnModule(M);
+    delete MP;
+    // Now Encrypt Strings
+    MP = createStringEncryptionPass(EnableAllObfuscation ||
+                                    EnableStringEncryption);
+    MP->runOnModule(M);
+    delete MP;
+    // Now perform Function-Level Obfuscation
+    for (Function &F : M)
+      if (!F.isDeclaration()) {
+        FunctionPass *P = nullptr;
+        P = createSplitBasicBlockPass(EnableAllObfuscation ||
+                                      EnableBasicBlockSplit);
+        P->runOnFunction(F);
+        delete P;
+        P = createBogusControlFlowPass(EnableAllObfuscation ||
+                                       EnableBogusControlFlow);
+        P->runOnFunction(F);
+        delete P;
+        P = createFlatteningPass(EnableAllObfuscation || EnableFlattening);
+        P->runOnFunction(F);
+        delete P;
+        P = createSubstitutionPass(EnableAllObfuscation || EnableSubstitution);
+        P->runOnFunction(F);
+        delete P;
+        P = createMBAObfuscationPass(EnableAllObfuscation || EnableMBAObfuscation);
+        P->runOnFunction(F);
+        delete P;
+        P = createOpaquePredicatesPass(EnableAllObfuscation || EnableOpaquePredicates);
+        P->runOnFunction(F);
+        delete P;
+        P = createVMFlattenPass(EnableVMFlatten);
+        P->runOnFunction(F);
+        delete P;
+      }
+    MP = createConstantEncryptionPass(EnableConstantEncryption);
+    MP->runOnModule(M);
+    delete MP;
+    errs() << "Doing Post-Run Cleanup\n";
+    FunctionPass *P = createIndirectBranchPass(EnableAllObfuscation ||
+                                               EnableIndirectBranching);
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        P->runOnFunction(F);
+    delete P;
+    MP = createFunctionWrapperPass(EnableAllObfuscation ||
+                                   EnableFunctionWrapper);
+    MP->runOnModule(M);
+    delete MP;
+    // Cleanup Flags
+    SmallVector<Function *, 8> toDelete;
+    for (Function &F : M)
+      if (F.isDeclaration() && F.hasName() &&
+#if LLVM_VERSION_MAJOR >= 18
+          F.getName().starts_with("hikari_")) {
+#else
+          F.getName().startswith("hikari_")) {
+#endif
+        for (User *U : F.users())
+          if (Instruction *Inst = dyn_cast<Instruction>(U))
+            Inst->eraseFromParent();
+        toDelete.emplace_back(&F);
+      }
+    for (Function *F : toDelete)
+      F->eraseFromParent();
+
+    timer->stopTimer();
+    errs() << "Hikari Out\n";
+    errs() << "Spend Time: "
+           << format("%.7f", timer->getTotalTime().getWallTime()) << "s"
+           << "\n";
+    tg->clearAll();
+    return true;
+  } // End runOnModule
 };
-
-} // namespace
-
-char MBAObfuscation::ID = 0;
-INITIALIZE_PASS(MBAObfuscation, "mbaobf", "Enable MBA Obfuscation.", false,
-                false)
-FunctionPass *llvm::createMBAObfuscationPass(bool flag) {
-  return new MBAObfuscation(flag);
+ModulePass *createObfuscationLegacyPass() {
+  LoadEnv();
+  if (AesSeed != 0x1337) {
+    cryptoutils->prng_seed(AesSeed);
+  } else {
+    cryptoutils->prng_seed();
+  }
+  errs() << "Initializing Hikari Core with Revision ID:" << GIT_COMMIT_HASH
+         << "\n";
+  return new Obfuscation();
 }
+
+PreservedAnalyses ObfuscationPass::run(Module &M, ModuleAnalysisManager &MAM) {
+  if (createObfuscationLegacyPass()->runOnModule(M)) {
+    return PreservedAnalyses::none();
+  }
+  return PreservedAnalyses::all();
+}
+
+} // namespace llvm
+char Obfuscation::ID = 0;
+INITIALIZE_PASS_BEGIN(Obfuscation, "obfus", "Enable Obfuscation", false, false)
+INITIALIZE_PASS_DEPENDENCY(AntiClassDump);
+INITIALIZE_PASS_DEPENDENCY(BogusControlFlow);
+INITIALIZE_PASS_DEPENDENCY(Flattening);
+INITIALIZE_PASS_DEPENDENCY(FunctionCallObfuscate);
+INITIALIZE_PASS_DEPENDENCY(IndirectBranch);
+INITIALIZE_PASS_DEPENDENCY(SplitBasicBlock);
+INITIALIZE_PASS_DEPENDENCY(StringEncryption);
+INITIALIZE_PASS_DEPENDENCY(Substitution);
+INITIALIZE_PASS_DEPENDENCY(MBAObfuscation);
+INITIALIZE_PASS_DEPENDENCY(OpaquePredicates);
+INITIALIZE_PASS_DEPENDENCY(VMFlatten);
+INITIALIZE_PASS_END(Obfuscation, "obfus", "Enable Obfuscation", false, false)
+
+#if LLVM_VERSION_MAJOR >= 18
+
+namespace llvm {
+
+PassPluginLibraryInfo getHikariPluginInfo() {
+  return {
+      LLVM_PLUGIN_API_VERSION, "Hikari", LLVM_VERSION_STRING,
+      [](PassBuilder &PB) {
+        PB.registerPipelineParsingCallback(
+            [](StringRef Name, ModulePassManager &FPM,
+               ArrayRef<PassBuilder::PipelineElement> InnerPipeline) {
+              if (Name == EnableIRObfusaction.ArgStr) {
+                EnableIRObfusaction = true;
+                for (const auto &Element : InnerPipeline) {
+                  if (Element.Name == EnableAntiClassDump.ArgStr) {
+                    EnableAntiClassDump = true;
+                  } else if (Element.Name == EnableAntiHooking.ArgStr) {
+                    EnableAntiHooking = true;
+                  } else if (Element.Name == EnableAntiDebugging.ArgStr) {
+                    EnableAntiDebugging = true;
+                  } else if (Element.Name == EnableBogusControlFlow.ArgStr) {
+                    EnableBogusControlFlow = true;
+                  } else if (Element.Name == EnableFlattening.ArgStr) {
+                    EnableFlattening = true;
+                  } else if (Element.Name == EnableBasicBlockSplit.ArgStr) {
+                    EnableBasicBlockSplit = true;
+                  } else if (Element.Name == EnableSubstitution.ArgStr) {
+                    EnableSubstitution = true;
+                  } else if (Element.Name == EnableAllObfuscation.ArgStr) {
+                    EnableAllObfuscation = true;
+                  } else if (Element.Name ==
+                             EnableFunctionCallObfuscate.ArgStr) {
+                    EnableFunctionCallObfuscate = true;
+                  } else if (Element.Name == EnableStringEncryption.ArgStr) {
+                    EnableStringEncryption = true;
+                  } else if (Element.Name == EnableConstantEncryption.ArgStr) {
+                    EnableConstantEncryption = true;
+                  } else if (Element.Name == EnableIndirectBranching.ArgStr) {
+                    EnableIndirectBranching = true;
+                  } else if (Element.Name == EnableFunctionWrapper.ArgStr) {
+                    EnableFunctionWrapper = true;
+                  } else if (Element.Name == EnableMBAObfuscation.ArgStr) {
+                    EnableMBAObfuscation = true;
+                  } else if (Element.Name == EnableOpaquePredicates.ArgStr) {
+                    EnableOpaquePredicates = true;
+                  } else if (Element.Name == EnableVMFlatten.ArgStr) {
+                    EnableVMFlatten = true;
+                  }
+                }
+
+                FPM.addPass(ObfuscationPass());
+                return true;
+              } else {
+                return false;
+              }
+            });
+      }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+  return getHikariPluginInfo();
+}
+
+} // namespace llvm
+
+#endif
