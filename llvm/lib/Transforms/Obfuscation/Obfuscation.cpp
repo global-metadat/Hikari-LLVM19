@@ -10,6 +10,8 @@
 #include "llvm/Transforms/Obfuscation/MBAObfuscation.h"
 #include "llvm/Transforms/Obfuscation/OpaquePredicates.h"
 #include "llvm/Transforms/Obfuscation/VMFlatten.h"
+#include "llvm/Transforms/Obfuscation/AntiLinearSweep.h"
+#include "llvm/Transforms/Obfuscation/AntiHexRays.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -73,6 +75,12 @@ static cl::opt<bool>
 static cl::opt<bool>
     EnableVMFlatten("enable-vmflatten", cl::init(false), cl::NotHidden,
                     cl::desc("Enable VM-based Control Flow Virtualization."));
+static cl::opt<bool>
+    EnableAntiLinearSweep("enable-antidisasm", cl::init(false), cl::NotHidden,
+                          cl::desc("Enable Anti-Disassembly (junk bytes, fake branches)."));
+static cl::opt<bool>
+    EnableAntiHexRays("enable-antihexrays", cl::init(false), cl::NotHidden,
+                      cl::desc("Enable Anti-Decompiler (breaks Hex-Rays)."));
 // End Obfuscator Options
 
 static void LoadEnv(void) {
@@ -123,6 +131,12 @@ static void LoadEnv(void) {
   }
   if (getenv("VMFLATTEN")) {
     EnableVMFlatten = true;
+  }
+  if (getenv("ANTIDISASM")) {
+    EnableAntiLinearSweep = true;
+  }
+  if (getenv("ANTIHEXRAYS")) {
+    EnableAntiHexRays = true;
   }
 }
 namespace llvm {
@@ -196,7 +210,16 @@ struct Obfuscation : public ModulePass {
         P = createOpaquePredicatesPass(EnableAllObfuscation || EnableOpaquePredicates);
         P->runOnFunction(F);
         delete P;
-        P = createVMFlattenPass(EnableVMFlatten);
+        // VM Virtualization — applies to ALL functions when flag is set
+        // (no annotation needed, unlike before)
+        P = createVMFlattenPass(EnableAllObfuscation || EnableVMFlatten);
+        P->runOnFunction(F);
+        delete P;
+        // Anti-RE passes — LAST, after all obfuscation
+        P = createAntiHexRaysPass(EnableAllObfuscation || EnableAntiHexRays);
+        P->runOnFunction(F);
+        delete P;
+        P = createAntiLinearSweepPass(EnableAllObfuscation || EnableAntiLinearSweep);
         P->runOnFunction(F);
         delete P;
       }
@@ -273,6 +296,8 @@ INITIALIZE_PASS_DEPENDENCY(Substitution);
 INITIALIZE_PASS_DEPENDENCY(MBAObfuscation);
 INITIALIZE_PASS_DEPENDENCY(OpaquePredicates);
 INITIALIZE_PASS_DEPENDENCY(VMFlatten);
+INITIALIZE_PASS_DEPENDENCY(AntiLinearSweep);
+INITIALIZE_PASS_DEPENDENCY(AntiHexRays);
 INITIALIZE_PASS_END(Obfuscation, "obfus", "Enable Obfuscation", false, false)
 
 #if LLVM_VERSION_MAJOR >= 18
@@ -322,6 +347,10 @@ PassPluginLibraryInfo getHikariPluginInfo() {
                     EnableOpaquePredicates = true;
                   } else if (Element.Name == EnableVMFlatten.ArgStr) {
                     EnableVMFlatten = true;
+                  } else if (Element.Name == EnableAntiLinearSweep.ArgStr) {
+                    EnableAntiLinearSweep = true;
+                  } else if (Element.Name == EnableAntiHexRays.ArgStr) {
+                    EnableAntiHexRays = true;
                   }
                 }
 
