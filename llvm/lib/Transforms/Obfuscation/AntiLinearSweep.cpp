@@ -36,8 +36,6 @@ static cl::opt<unsigned> ALSDensity(
     "als_density", cl::init(2), cl::NotHidden,
     cl::desc("Number of anti-disasm insertions per block (1-4)"));
 
-extern llvm::CryptoUtils *cryptoutils;
-
 namespace {
 
 // ARM64 instructions that confuse analysis tools
