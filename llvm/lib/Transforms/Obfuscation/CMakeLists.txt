@@ -19,6 +19,11 @@ add_llvm_component_library(LLVMObfuscation
         VMFlatten.cpp
         AntiLinearSweep.cpp
         AntiHexRays.cpp
+        ReturnAddressEncryption.cpp
+        InstructionLevelAntiPatching.cpp
+        CallStackSpoofing.cpp
+        SyscallInliner.cpp
+        CodeIntegrityReflection.cpp
         Obfuscation.cpp
         DEPENDS
         intrinsics_gen
