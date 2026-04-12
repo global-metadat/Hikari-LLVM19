@@ -377,16 +377,19 @@ struct VMFlatten : public FunctionPass {
     for (uint32_t i = 0; i < 16; i++)
       bytecode.push_back(cryptoutils->get_uint32_t());
 
-    // Rebuild bytecode GV
-    bcGV->eraseFromParent();
+    // Rebuild bytecode GV — must RAUW so existing references (fake
+    // handler GEPs) point to the new GV instead of dangling.
     std::vector<Constant *> bcElements2;
     for (uint32_t val : bytecode)
       bcElements2.push_back(ConstantInt::get(I32Ty, val));
     ArrayType *bcArrayTy2 = ArrayType::get(I32Ty, bcElements2.size());
     Constant *bcInit2 = ConstantArray::get(bcArrayTy2, bcElements2);
-    bcGV = new GlobalVariable(
+    GlobalVariable *newBcGV = new GlobalVariable(
         M, bcArrayTy2, true, GlobalValue::PrivateLinkage, bcInit2,
-        "vm.bytecode." + F->getName());
+        "vm.bytecode2." + F->getName());
+    bcGV->replaceAllUsesWith(newBcGV);
+    bcGV->eraseFromParent();
+    bcGV = newBcGV;
     bcArrayTy = bcArrayTy2;
 
     // ── Step 9: Create BlockAddress handler table (for indirectbr dispatch) ──
