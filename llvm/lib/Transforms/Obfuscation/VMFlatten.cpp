@@ -178,15 +178,12 @@ struct VMFlatten : public FunctionPass {
     AllocaInst *switchVarAddr = new AllocaInst(
         PointerType::get(I32Ty, DL.getAllocaAddrSpace()),
         DL.getAllocaAddrSpace(), "vm.stateaddr", BasicBlock::iterator(oldTerm));
-    AllocaInst *pcVar = new AllocaInst(I32Ty, DL.getAllocaAddrSpace(),
-                                       "vm.pc", oldTerm);
 
     oldTerm->eraseFromParent();
 
     // Initialize state to first block's case ID
     new StoreInst(ConstantInt::get(I32Ty, caseIDs[0]), switchVar, entryBB);
     new StoreInst(switchVar, switchVarAddr, entryBB);
-    new StoreInst(ConstantInt::get(I32Ty, 0), pcVar, entryBB);
 
     // ── Step 5: Build bytecode array with double-layer encoding ──
     std::vector<uint32_t> bytecode;
@@ -252,30 +249,197 @@ struct VMFlatten : public FunctionPass {
         M, I32Ty, false, GlobalValue::PrivateLinkage,
         ConstantInt::get(I32Ty, xorKey2), "vm.key2." + F->getName());
 
-    // ── Step 6: Create the VM dispatcher loop ──
-    BasicBlock *loopEntry = BasicBlock::Create(Ctx, "vm.loop", F, entryBB);
+    // ── Step 6: Create fake handler blocks ──
+    // Build fakes first so they're in the handler table alongside real blocks
+    // This makes them indistinguishable from real handlers in the BlockAddress array
     BasicBlock *loopEnd = BasicBlock::Create(Ctx, "vm.loopEnd", F, entryBB);
 
-    LoadInst *stateLoad = new LoadInst(I32Ty, switchVar, "vm.curState", loopEntry);
+    SmallVector<BasicBlock *, 16> fakeBBs;
+    for (uint32_t i = 0; i < VMFakeHandlers; i++) {
+      BasicBlock *fakeBB = BasicBlock::Create(Ctx, "vm.fake", F, loopEnd);
+      IRBuilder<> B(fakeBB);
+
+      AllocaInst *junkVar = B.CreateAlloca(I32Ty);
+      B.CreateStore(ConstantInt::get(I32Ty, cryptoutils->get_uint32_t()), junkVar);
+      Value *jv = B.CreateLoad(I32Ty, junkVar);
+      unsigned numOps = 3 + cryptoutils->get_range(4);
+      for (unsigned j = 0; j < numOps; j++) {
+        uint32_t c = cryptoutils->get_range(1, UINT16_MAX);
+        switch (cryptoutils->get_range(6)) {
+        case 0: jv = B.CreateAdd(jv, ConstantInt::get(I32Ty, c)); break;
+        case 1: jv = B.CreateXor(jv, ConstantInt::get(I32Ty, c)); break;
+        case 2: jv = B.CreateMul(jv, ConstantInt::get(I32Ty, c)); break;
+        case 3: jv = B.CreateSub(jv, ConstantInt::get(I32Ty, c)); break;
+        case 4: jv = B.CreateShl(jv, ConstantInt::get(I32Ty, c % 31)); break;
+        case 5: jv = B.CreateLShr(jv, ConstantInt::get(I32Ty, c % 31)); break;
+        }
+      }
+      // Fake bytecode fetch
+      Value *fakePC = ConstantInt::get(I32Ty, cryptoutils->get_range(bytecode.size()));
+      Value *fakeIdx[] = {ConstantInt::get(I32Ty, 0), fakePC};
+      Value *fakePtr = B.CreateInBoundsGEP(bcArrayTy, bcGV, fakeIdx);
+      Value *fakeEnc = B.CreateLoad(I32Ty, fakePtr);
+      Value *fakeKey = B.CreateLoad(I32Ty, keyGV, true);
+      Value *fakeDec = B.CreateXor(fakeEnc, fakeKey);
+      B.CreateStore(B.CreateAdd(jv, fakeDec),
+                    B.CreateLoad(switchVarAddr->getAllocatedType(), switchVarAddr));
+      // Fake handler branches back to loop — left as placeholder, fixed below
+      fakeBBs.push_back(fakeBB);
+    }
+
+    // ── Step 7: Build per-function opcode permutation table ──
+    // Total entries: real blocks + fake handlers. Randomly permuted so
+    // the same index means different handlers in different functions.
+    // Uses indirectbr (computed goto) instead of switch — IDA can't build
+    // a switch table and doesn't see the handler cluster.
+    uint32_t totalHandlers = origBBs.size() + fakeBBs.size();
+    // Round up to next power of 2 for masking (prevents out-of-bounds)
+    uint32_t tableSize = 1;
+    while (tableSize < totalHandlers + 1) // +1 for default
+      tableSize <<= 1;
+
+    // Build a permuted mapping: index -> handler BB
+    // Real handlers get assigned random slots, fakes fill the rest
+    std::vector<uint32_t> permutation(tableSize);
+    for (uint32_t i = 0; i < tableSize; i++)
+      permutation[i] = i;
+    // Fisher-Yates shuffle
+    for (uint32_t i = tableSize - 1; i > 0; i--)
+      std::swap(permutation[i], permutation[cryptoutils->get_range(i + 1)]);
+
+    // Default/trap block — for out-of-range indices
+    BasicBlock *trapBB = BasicBlock::Create(Ctx, "vm.trap", F, loopEnd);
+    {
+      IRBuilder<> B(trapBB);
+      B.CreateBr(loopEnd); // loop back (trapped)
+    }
+
+    // Build the handler table: permutation[slot] -> BB
+    // indexForBB[i] = slot in the permutation table for origBBs[i]
+    std::vector<BasicBlock *> handlerTable(tableSize, trapBB);
+    std::vector<uint32_t> indexForBB(origBBs.size());
+
+    // Assign real blocks to the first origBBs.size() permuted slots
+    for (size_t i = 0; i < origBBs.size(); i++) {
+      uint32_t slot = permutation[i];
+      handlerTable[slot] = origBBs[i];
+      indexForBB[i] = slot;
+    }
+    // Assign fake blocks to the next fakeBBs.size() permuted slots
+    for (size_t i = 0; i < fakeBBs.size(); i++) {
+      uint32_t slot = permutation[origBBs.size() + i];
+      handlerTable[slot] = fakeBBs[i];
+    }
+
+    // Remap case IDs to use slot indices
+    for (size_t i = 0; i < origBBs.size(); i++)
+      caseIDs[i] = indexForBB[i];
+    // Rebuild bbToCase with new indices
+    for (size_t i = 0; i < origBBs.size(); i++)
+      bbToCase[origBBs[i]] = caseIDs[i];
+
+    // ── Step 8: Rebuild bytecode with permuted indices ──
+    // (We need to re-encode since caseIDs changed to slot indices)
+    bytecode.clear();
+    for (size_t i = 0; i < origBBs.size(); i++) {
+      BasicBlock *BB = origBBs[i];
+      bbToBytecodePC[BB] = bytecode.size();
+
+      Instruction *term = BB->getTerminator();
+      if (isa<ReturnInst>(term) || isa<UnreachableInst>(term)) {
+        bytecode.push_back(0xFFFFFFFF ^ xorKey);
+      } else if (BranchInst *BI = dyn_cast<BranchInst>(term)) {
+        if (!BI->isConditional()) {
+          BasicBlock *succ = BI->getSuccessor(0);
+          uint32_t targetCase = bbToCase.count(succ) ? bbToCase[succ] : caseIDs[0];
+          uint32_t encoded = targetCase ^ xorKey;
+          uint32_t pos = bytecode.size();
+          encoded ^= (xorKey2 << (pos % 17)) | (xorKey2 >> (32 - (pos % 17)));
+          bytecode.push_back(encoded);
+        } else {
+          BasicBlock *succT = BI->getSuccessor(0);
+          BasicBlock *succF = BI->getSuccessor(1);
+          uint32_t tCase = bbToCase.count(succT) ? bbToCase[succT] : caseIDs[0];
+          uint32_t fCase = bbToCase.count(succF) ? bbToCase[succF] : caseIDs[0];
+
+          uint32_t posT = bytecode.size();
+          uint32_t encT = tCase ^ xorKey;
+          encT ^= (xorKey2 << (posT % 17)) | (xorKey2 >> (32 - (posT % 17)));
+          bytecode.push_back(encT);
+
+          uint32_t posF = bytecode.size();
+          uint32_t encF = fCase ^ xorKey;
+          encF ^= (xorKey2 << (posF % 17)) | (xorKey2 >> (32 - (posF % 17)));
+          bytecode.push_back(encF);
+        }
+      }
+    }
+    for (uint32_t i = 0; i < 16; i++)
+      bytecode.push_back(cryptoutils->get_uint32_t());
+
+    // Rebuild bytecode GV
+    bcGV->eraseFromParent();
+    std::vector<Constant *> bcElements2;
+    for (uint32_t val : bytecode)
+      bcElements2.push_back(ConstantInt::get(I32Ty, val));
+    ArrayType *bcArrayTy2 = ArrayType::get(I32Ty, bcElements2.size());
+    Constant *bcInit2 = ConstantArray::get(bcArrayTy2, bcElements2);
+    bcGV = new GlobalVariable(
+        M, bcArrayTy2, true, GlobalValue::PrivateLinkage, bcInit2,
+        "vm.bytecode." + F->getName());
+    bcArrayTy = bcArrayTy2;
+
+    // ── Step 9: Create BlockAddress handler table (for indirectbr dispatch) ──
+    auto *I8PtrTy = PointerType::get(Type::getInt8Ty(Ctx), 0);
+    SmallVector<Constant *, 32> tableElements;
+    for (uint32_t i = 0; i < tableSize; i++)
+      tableElements.push_back(BlockAddress::get(F, handlerTable[i]));
+
+    ArrayType *tableTy = ArrayType::get(I8PtrTy, tableSize);
+    Constant *tableInit = ConstantArray::get(tableTy, tableElements);
+    GlobalVariable *tableGV = new GlobalVariable(
+        M, tableTy, true, GlobalValue::PrivateLinkage, tableInit,
+        "vm.handlers." + F->getName());
+
+    // Mask for bounds (tableSize is power of 2)
+    uint32_t tableMask = tableSize - 1;
+
+    // ── Step 10: Create the VM dispatcher loop with indirectbr ──
+    BasicBlock *loopEntry = BasicBlock::Create(Ctx, "vm.loop", F, entryBB);
 
     entryBB->moveBefore(loopEntry);
     BranchInst::Create(loopEntry, entryBB);
     BranchInst::Create(loopEntry, loopEnd);
 
-    BasicBlock *swDefault = BasicBlock::Create(Ctx, "vm.default", F, loopEnd);
-    BranchInst::Create(loopEnd, swDefault);
+    // Dispatcher: load state, mask, index into handler table, indirectbr
+    IRBuilder<> DispB(loopEntry);
+    Value *stateLoad = DispB.CreateLoad(I32Ty, switchVar, "vm.curState");
+    Value *masked = DispB.CreateAnd(stateLoad,
+                                    ConstantInt::get(I32Ty, tableMask),
+                                    "vm.masked");
+    Value *gep = DispB.CreateInBoundsGEP(
+        tableTy, tableGV,
+        {ConstantInt::get(I32Ty, 0), masked}, "vm.hptr");
+    Value *target = DispB.CreateLoad(I8PtrTy, gep, "vm.target");
+    IndirectBrInst *IBr = DispB.CreateIndirectBr(target, tableSize);
+    // Add all handler BBs as possible destinations
+    for (uint32_t i = 0; i < tableSize; i++)
+      IBr->addDestination(handlerTable[i]);
+    IBr->addDestination(loopEnd); // for the back-edge
 
-    SwitchInst *switchI = SwitchInst::Create(stateLoad, swDefault, 0, loopEntry);
-
-    // ── Step 7: Wire original BBs into the switch ──
+    // ── Step 11: Wire original BBs — move and replace terminators ──
     for (size_t i = 0; i < origBBs.size(); i++) {
       BasicBlock *BB = origBBs[i];
       BB->moveBefore(loopEnd);
-      auto *caseVal = cast<ConstantInt>(ConstantInt::get(I32Ty, caseIDs[i]));
-      switchI->addCase(caseVal, BB);
     }
+    for (size_t i = 0; i < fakeBBs.size(); i++) {
+      fakeBBs[i]->moveBefore(loopEnd);
+      // Fake handlers branch back to loop
+      BranchInst::Create(loopEnd, fakeBBs[i]);
+    }
+    trapBB->moveBefore(loopEnd);
 
-    // ── Step 8: Replace terminators with VM bytecode fetch + double decode ──
+    // ── Step 12: Replace terminators with VM bytecode fetch + decode ──
     for (size_t i = 0; i < origBBs.size(); i++) {
       BasicBlock *BB = origBBs[i];
       Instruction *term = BB->getTerminator();
@@ -289,13 +453,11 @@ struct VMFlatten : public FunctionPass {
           BI->eraseFromParent();
           IRBuilder<> B(BB);
 
-          // Fetch bytecode[pc]
           Value *pcVal = ConstantInt::get(I32Ty, pc);
           Value *indices[] = {ConstantInt::get(I32Ty, 0), pcVal};
           Value *bcPtr = B.CreateInBoundsGEP(bcArrayTy, bcGV, indices);
           Value *encoded = B.CreateLoad(I32Ty, bcPtr, "vm.enc");
 
-          // Double decode: undo key2 rotation, then key1 XOR
           Value *k2 = B.CreateLoad(I32Ty, key2GV, true, "vm.k2");
           Value *posConst = ConstantInt::get(I32Ty, pc % 17);
           Value *negPos = B.CreateSub(ConstantInt::get(I32Ty, 32), posConst);
@@ -316,7 +478,6 @@ struct VMFlatten : public FunctionPass {
           BI->eraseFromParent();
           IRBuilder<> B(BB);
 
-          // Fetch true/false bytecodes
           auto fetchAndDecode = [&](uint32_t pcIdx) -> Value * {
             Value *pcV = ConstantInt::get(I32Ty, pcIdx);
             Value *idx[] = {ConstantInt::get(I32Ty, 0), pcV};
@@ -345,52 +506,6 @@ struct VMFlatten : public FunctionPass {
           B.CreateBr(loopEnd);
         }
       }
-    }
-
-    // ── Step 9: Add fake handler blocks with realistic code ──
-    for (uint32_t i = 0; i < VMFakeHandlers; i++) {
-      BasicBlock *fakeBB = BasicBlock::Create(Ctx, "vm.fake", F, loopEnd);
-      IRBuilder<> B(fakeBB);
-
-      // More realistic junk — mimics real VM handler patterns
-      AllocaInst *junkVar = B.CreateAlloca(I32Ty);
-      B.CreateStore(ConstantInt::get(I32Ty, cryptoutils->get_uint32_t()), junkVar);
-      Value *jv = B.CreateLoad(I32Ty, junkVar);
-
-      // Random arithmetic chain (3-6 ops)
-      unsigned numOps = 3 + cryptoutils->get_range(4);
-      for (unsigned j = 0; j < numOps; j++) {
-        uint32_t c = cryptoutils->get_range(1, UINT16_MAX);
-        switch (cryptoutils->get_range(6)) {
-        case 0: jv = B.CreateAdd(jv, ConstantInt::get(I32Ty, c)); break;
-        case 1: jv = B.CreateXor(jv, ConstantInt::get(I32Ty, c)); break;
-        case 2: jv = B.CreateMul(jv, ConstantInt::get(I32Ty, c)); break;
-        case 3: jv = B.CreateSub(jv, ConstantInt::get(I32Ty, c)); break;
-        case 4: jv = B.CreateShl(jv, ConstantInt::get(I32Ty, c % 31)); break;
-        case 5: jv = B.CreateLShr(jv, ConstantInt::get(I32Ty, c % 31)); break;
-        }
-      }
-
-      // Fake bytecode fetch (reads from the real array — confuses analysis)
-      Value *fakePC = ConstantInt::get(I32Ty, cryptoutils->get_range(bytecode.size()));
-      Value *fakeIdx[] = {ConstantInt::get(I32Ty, 0), fakePC};
-      Value *fakePtr = B.CreateInBoundsGEP(bcArrayTy, bcGV, fakeIdx);
-      Value *fakeEnc = B.CreateLoad(I32Ty, fakePtr);
-      Value *fakeKey = B.CreateLoad(I32Ty, keyGV, true);
-      Value *fakeDec = B.CreateXor(fakeEnc, fakeKey);
-
-      // Store fake result (creates xref to switchVar — confuses data flow)
-      B.CreateStore(B.CreateAdd(jv, fakeDec),
-                    B.CreateLoad(switchVarAddr->getAllocatedType(), switchVarAddr));
-      B.CreateBr(loopEnd);
-
-      // Unique unreachable case ID
-      uint32_t fakeID;
-      do {
-        fakeID = cryptoutils->get_uint32_t();
-      } while (usedIDs.count(fakeID));
-      usedIDs.insert(fakeID);
-      switchI->addCase(cast<ConstantInt>(ConstantInt::get(I32Ty, fakeID)), fakeBB);
     }
 
     // ── Step 10: Fix SSA ──
