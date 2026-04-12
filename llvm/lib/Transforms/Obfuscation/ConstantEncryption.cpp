@@ -349,8 +349,23 @@ struct ConstantEncryption : public ModulePass {
     ConstantInt *New = keyandnew.second;
     if (!Key || !New)
       return;
+
+    // Store the XOR key in a private GlobalVariable and load it at runtime
+    // with volatile. This prevents LLVM InstCombine from constant-folding
+    // `New XOR Key` back to the original constant, which was the main
+    // weakness of the old approach where Key was a bare ConstantInt literal.
+    Module *M = I->getModule();
+    char gvName[32];
+    snprintf(gvName, sizeof(gvName), "ce_%08x", cryptoutils->get_uint32_t());
+    GlobalVariable *KeyGV = new GlobalVariable(
+        *M, Key->getType(), /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        Key, gvName);
+    // Volatile load — the key is only known at runtime from LLVM's perspective
+    LoadInst *KeyLoad =
+        new LoadInst(Key->getType(), KeyGV, "ce.key", /*isVolatile=*/true, I);
+
     BinaryOperator *NewOperand =
-        BinaryOperator::Create(Instruction::Xor, New, Key, "", I);
+        BinaryOperator::Create(Instruction::Xor, New, KeyLoad, "", I);
 
     I->setOperand(opindex, NewOperand);
     if (SubstituteXorTemp &&
