@@ -16,6 +16,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Format.h"
 #include <cstdlib>
 
 using namespace llvm;
@@ -27,6 +28,11 @@ static cl::opt<bool>
                         cl::ZeroOrMore);
 static cl::opt<uint64_t> AesSeed("aesSeed", cl::init(0x1337),
                                  cl::desc("seed for the PRNG"));
+static cl::opt<uint64_t>
+    ObfSeed("obf-seed", cl::init(0),
+            cl::desc("Deterministic seed for obfuscation PRNG. When non-zero, "
+                     "overrides -aesSeed and time-based seeding. Use the same "
+                     "value across builds for reproducible obfuscated output."));
 static cl::opt<bool> EnableAntiClassDump("enable-acdobf", cl::init(false),
                                          cl::NotHidden,
                                          cl::desc("Enable AntiClassDump."));
@@ -81,6 +87,26 @@ static cl::opt<bool>
 static cl::opt<bool>
     EnableAntiHexRays("enable-antihexrays", cl::init(false), cl::NotHidden,
                       cl::desc("Enable Anti-Decompiler (breaks Hex-Rays)."));
+static cl::opt<bool>
+    EnableReturnAddressEncryption("enable-retenc", cl::init(false),
+                                 cl::NotHidden,
+                                 cl::desc("Enable Return Address Encryption."));
+static cl::opt<bool>
+    EnableInstructionLevelAntiPatching(
+        "enable-iap", cl::init(false), cl::NotHidden,
+        cl::desc("Enable Instruction-Level Anti-Patching integrity checks."));
+static cl::opt<bool>
+    EnableCallStackSpoofing("enable-callstack-spoof", cl::init(false),
+                            cl::NotHidden,
+                            cl::desc("Enable Call Stack Spoofing."));
+static cl::opt<bool>
+    EnableSyscallInliner("enable-syscall-inliner", cl::init(false),
+                         cl::NotHidden,
+                         cl::desc("Replace libc syscall wrappers with svc."));
+static cl::opt<bool>
+    EnableCodeIntegrityReflection(
+        "enable-cir", cl::init(false), cl::NotHidden,
+        cl::desc("Enable cross-function Code Integrity Reflection."));
 // End Obfuscator Options
 
 static void LoadEnv(void) {
@@ -103,7 +129,7 @@ static void LoadEnv(void) {
     EnableIndirectBranching = true;
   }
   if (getenv("FUNCWRA")) {
-    EnableFunctionWrapper = true; // Broken
+    EnableFunctionWrapper = true;
   }
   if (getenv("BCFOBF")) {
     EnableBogusControlFlow = true;
@@ -138,6 +164,21 @@ static void LoadEnv(void) {
   if (getenv("ANTIHEXRAYS")) {
     EnableAntiHexRays = true;
   }
+  if (getenv("RETENC")) {
+    EnableReturnAddressEncryption = true;
+  }
+  if (getenv("IAP")) {
+    EnableInstructionLevelAntiPatching = true;
+  }
+  if (getenv("CALLSTACK_SPOOF")) {
+    EnableCallStackSpoofing = true;
+  }
+  if (getenv("SYSCALL_INLINE")) {
+    EnableSyscallInliner = true;
+  }
+  if (getenv("CIR")) {
+    EnableCodeIntegrityReflection = true;
+  }
 }
 namespace llvm {
 struct Obfuscation : public ModulePass {
@@ -171,9 +212,17 @@ struct Obfuscation : public ModulePass {
       P->runOnModule(M);
       delete P;
     }
+    // SyscallInliner runs BEFORE FunctionCallObfuscate so libc syscall
+    // wrappers are replaced with svc #0 before FCO obfuscates the call.
+    FunctionPass *FP = createSyscallInlinerPass(
+        EnableAllObfuscation || EnableSyscallInliner);
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        FP->runOnFunction(F);
+    delete FP;
     // Now do FCO
-    FunctionPass *FP = createFunctionCallObfuscatePass(
-        EnableAllObfuscation || EnableFunctionCallObfuscate);
+    FP = createFunctionCallObfuscatePass(EnableAllObfuscation ||
+                                         EnableFunctionCallObfuscate);
     for (Function &F : M)
       if (!F.isDeclaration())
         FP->runOnFunction(F);
@@ -190,17 +239,19 @@ struct Obfuscation : public ModulePass {
     for (Function &F : M)
       if (!F.isDeclaration()) {
         FunctionPass *P = nullptr;
+        // ReturnAddressEncryption runs FIRST so later passes (BCF, MBA, Sub)
+        // obfuscate the key-load + XOR code itself
+        P = createReturnAddressEncryptionPass(EnableAllObfuscation ||
+                                              EnableReturnAddressEncryption);
+        P->runOnFunction(F);
+        delete P;
         P = createSplitBasicBlockPass(EnableAllObfuscation ||
                                       EnableBasicBlockSplit);
         P->runOnFunction(F);
         delete P;
-        P = createBogusControlFlowPass(EnableAllObfuscation ||
-                                       EnableBogusControlFlow);
-        P->runOnFunction(F);
-        delete P;
-        P = createFlatteningPass(EnableAllObfuscation || EnableFlattening);
-        P->runOnFunction(F);
-        delete P;
+        // Arithmetic obfuscations FIRST — they produce more operations that
+        // the subsequent CFG-distortion passes can then hide behind fake
+        // branches and flattening.
         P = createSubstitutionPass(EnableAllObfuscation || EnableSubstitution);
         P->runOnFunction(F);
         delete P;
@@ -210,9 +261,32 @@ struct Obfuscation : public ModulePass {
         P = createOpaquePredicatesPass(EnableAllObfuscation || EnableOpaquePredicates);
         P->runOnFunction(F);
         delete P;
+        // CFG-distortion passes AFTER arithmetic — BCF's opaque predicates
+        // feed from OpaquePredicates, and Flattening must see the final
+        // arithmetic form.
+        P = createBogusControlFlowPass(EnableAllObfuscation ||
+                                       EnableBogusControlFlow);
+        P->runOnFunction(F);
+        delete P;
+        P = createFlatteningPass(EnableAllObfuscation || EnableFlattening);
+        P->runOnFunction(F);
+        delete P;
         // VM Virtualization — applies to ALL functions when flag is set
         // (no annotation needed, unlike before)
         P = createVMFlattenPass(EnableAllObfuscation || EnableVMFlatten);
+        P->runOnFunction(F);
+        delete P;
+        // Callstack spoofing — rewrites saved LR around callsites. Runs
+        // before IAP so the inserted pre/post-call stores are included in
+        // the integrity measurement.
+        P = createCallStackSpoofingPass(
+            EnableAllObfuscation || EnableCallStackSpoofing);
+        P->runOnFunction(F);
+        delete P;
+        // Integrity checks — placed before anti-RE passes so the inserted
+        // check blocks themselves get additional junk from AntiLinearSweep.
+        P = createInstructionLevelAntiPatchingPass(
+            EnableAllObfuscation || EnableInstructionLevelAntiPatching);
         P->runOnFunction(F);
         delete P;
         // Anti-RE passes — LAST, after all obfuscation
@@ -224,6 +298,12 @@ struct Obfuscation : public ModulePass {
         delete P;
       }
     MP = createConstantEncryptionPass(EnableConstantEncryption);
+    MP->runOnModule(M);
+    delete MP;
+    // CIR runs LAST of the obfuscation module-passes so it sees the
+    // final per-function layouts when reasoning about hash targets.
+    MP = createCodeIntegrityReflectionPass(EnableAllObfuscation ||
+                                           EnableCodeIntegrityReflection);
     MP->runOnModule(M);
     delete MP;
     errs() << "Doing Post-Run Cleanup\n";
@@ -265,8 +345,19 @@ struct Obfuscation : public ModulePass {
 };
 ModulePass *createObfuscationLegacyPass() {
   LoadEnv();
-  if (AesSeed != 0x1337) {
+  // Deterministic build: --obf-seed wins if set. Otherwise --aesSeed.
+  // Otherwise time-based.
+  if (ObfSeed != 0) {
+    cryptoutils->prng_seed(ObfSeed);
+    errs() << "Obfuscation PRNG seeded deterministically with --obf-seed="
+           << format_hex(ObfSeed, 18) << "\n";
+  } else if (AesSeed != 0x1337) {
     cryptoutils->prng_seed(AesSeed);
+  } else if (const char *envSeed = getenv("OBF_SEED")) {
+    uint64_t s = strtoull(envSeed, nullptr, 0);
+    cryptoutils->prng_seed(s);
+    errs() << "Obfuscation PRNG seeded from OBF_SEED="
+           << format_hex(s, 18) << "\n";
   } else {
     cryptoutils->prng_seed();
   }
@@ -298,6 +389,11 @@ INITIALIZE_PASS_DEPENDENCY(OpaquePredicates);
 INITIALIZE_PASS_DEPENDENCY(VMFlatten);
 INITIALIZE_PASS_DEPENDENCY(AntiLinearSweep);
 INITIALIZE_PASS_DEPENDENCY(AntiHexRays);
+INITIALIZE_PASS_DEPENDENCY(ReturnAddressEncryption);
+INITIALIZE_PASS_DEPENDENCY(InstructionLevelAntiPatching);
+INITIALIZE_PASS_DEPENDENCY(CallStackSpoofing);
+INITIALIZE_PASS_DEPENDENCY(SyscallInliner);
+INITIALIZE_PASS_DEPENDENCY(CodeIntegrityReflection);
 INITIALIZE_PASS_END(Obfuscation, "obfus", "Enable Obfuscation", false, false)
 
 #if LLVM_VERSION_MAJOR >= 18
@@ -351,6 +447,21 @@ PassPluginLibraryInfo getHikariPluginInfo() {
                     EnableAntiLinearSweep = true;
                   } else if (Element.Name == EnableAntiHexRays.ArgStr) {
                     EnableAntiHexRays = true;
+                  } else if (Element.Name ==
+                             EnableReturnAddressEncryption.ArgStr) {
+                    EnableReturnAddressEncryption = true;
+                  } else if (Element.Name ==
+                             EnableInstructionLevelAntiPatching.ArgStr) {
+                    EnableInstructionLevelAntiPatching = true;
+                  } else if (Element.Name ==
+                             EnableCallStackSpoofing.ArgStr) {
+                    EnableCallStackSpoofing = true;
+                  } else if (Element.Name ==
+                             EnableSyscallInliner.ArgStr) {
+                    EnableSyscallInliner = true;
+                  } else if (Element.Name ==
+                             EnableCodeIntegrityReflection.ArgStr) {
+                    EnableCodeIntegrityReflection = true;
                   }
                 }
 
