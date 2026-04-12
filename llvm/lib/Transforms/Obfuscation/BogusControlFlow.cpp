@@ -93,6 +93,7 @@
 
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/Transforms/Obfuscation/OpaquePredicates.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -747,68 +748,35 @@ struct BogusControlFlow : public FunctionPass {
       Instruction *tmp = &*(i->getParent()->getFirstNonPHIOrDbgOrLifetime());
       IRBuilder<> *IRBReal = new IRBuilder<>(tmp);
       IRBuilder<> IRBEmu(emuEntryBlock);
-      // First,Construct a real RHS that will be used in the actual condition
-      Constant *RealRHS = ConstantInt::get(I32Ty, cryptoutils->get_uint32_t());
-      // Prepare Initial LHS and RHS to bootstrap the emulator
-      Constant *LHSC =
-          ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
-      Constant *RHSC =
-          ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
-      GlobalVariable *LHSGV =
-          new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, LHSC, "LHSGV");
-      GlobalVariable *RHSGV =
-          new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, RHSC, "RHSGV");
-      LoadInst *LHS =
-          (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
-              ->CreateLoad(LHSGV->getValueType(), LHSGV, "Initial LHS");
-      LoadInst *RHS =
-          (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
-              ->CreateLoad(RHSGV->getValueType(), RHSGV, "Initial LHS");
 
-      // To Speed-Up Evaluation
-      Value *emuLHS = LHSC;
-      Value *emuRHS = RHSC;
-      Instruction::BinaryOps initialOp =
-          ops[cryptoutils->get_range(sizeof(ops) / sizeof(ops[0]))];
-      Value *emuLast =
-          IRBEmu.CreateBinOp(initialOp, emuLHS, emuRHS, "EmuInitialCondition");
-      Value *Last = (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
-                        ->CreateBinOp(initialOp, LHS, RHS, "InitialCondition");
-      for (uint32_t i = 0; i < ConditionExpressionComplexityTemp; i++) {
-        Constant *newTmp =
-            ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
-        Instruction::BinaryOps initialOp2 =
-            ops[cryptoutils->get_range(sizeof(ops) / sizeof(ops[0]))];
-        emuLast = IRBEmu.CreateBinOp(initialOp2, emuLast, newTmp,
-                                     "EmuInitialCondition");
-        Last = (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
-                   ->CreateBinOp(initialOp2, Last, newTmp, "InitialCondition");
-      }
-      // Randomly Generate Predicate
-      CmpInst::Predicate pred =
-          preds[cryptoutils->get_range(sizeof(preds) / sizeof(preds[0]))];
+      // ── Use strong compound opaque predicates from OpaquePredicates pass ──
+      // Instead of weak LHSGV/RHSGV binop chains that Z3 can simplify,
+      // we generate compound number-theoretic predicates that are provably
+      // always-true but resist symbolic simplification.
+      uint32_t complexity = 2 + ConditionExpressionComplexityTemp;
+
+      Value *Last;
       if (CreateFunctionForOpaquePredicateTemp) {
-        IRBOp->CreateRet(IRBOp->CreateICmp(pred, Last, RealRHS));
+        // Build predicate inside a separate function (for IndirectBranch)
+        LoadInst *opqLoad = createOpaqueLoad(*IRBOp, M,
+            "bcf_opq_" + F.getName().str());
+        Value *pred = genCompoundOpaquePredicate(*IRBOp, opqLoad, complexity);
+        IRBOp->CreateRet(pred);
         Last = IRBReal->CreateCall(opFunction);
-      } else
-        Last = IRBReal->CreateICmp(pred, Last, RealRHS);
-      emuLast = IRBEmu.CreateICmp(pred, emuLast, RealRHS);
-      ReturnInst *RI = IRBEmu.CreateRet(emuLast);
-      ConstantInt *emuCI = cast<ConstantInt>(RI->getReturnValue());
-      APInt emulateResult = emuCI->getValue();
-      if (emulateResult == 1) {
-        // Our ConstantExpr evaluates to true;
-        BranchInst::Create(((BranchInst *)i)->getSuccessor(0),
-                           ((BranchInst *)i)->getSuccessor(1), Last,
-                           i->getParent());
       } else {
-        // False, swap operands
-        BranchInst::Create(((BranchInst *)i)->getSuccessor(1),
-                           ((BranchInst *)i)->getSuccessor(0), Last,
-                           i->getParent());
+        // Build predicate inline
+        LoadInst *opqLoad = createOpaqueLoad(*IRBReal, M,
+            "bcf_opq_" + F.getName().str());
+        Last = genCompoundOpaquePredicate(*IRBReal, opqLoad, complexity);
       }
+
+      // Emulator: compound predicates are always true, so emulateResult = 1
+      IRBEmu.CreateRet(ConstantInt::getTrue(M.getContext()));
+
+      // Predicate is always true → real successor is the true branch
+      BranchInst::Create(((BranchInst *)i)->getSuccessor(0),
+                         ((BranchInst *)i)->getSuccessor(1), Last,
+                         i->getParent());
       emuFunction->eraseFromParent();
       i->eraseFromParent(); // erase the branch
     }
